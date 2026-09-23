@@ -58,8 +58,9 @@ described below.
   Desktop. See the [Docker Sandboxes docs](https://docs.docker.com/ai/sandboxes/)
   for install steps.
 - A Docker login, so kit and template images can be pulled: `sbx login`.
-- An Anthropic API key, or a token from `claude setup-token` on a machine with
-  Claude Code.
+- An Anthropic credential on the host, in one of the two shapes the kit
+  supports: an API key, or a Claude OAuth login. A token from
+  `claude setup-token` is not a third option -- see below.
 
 ## Store the credential first
 
@@ -73,19 +74,25 @@ An API key goes in as a service secret:
 sbx secret set anthropic
 ```
 
-A Claude subscription token goes in as a custom secret, with a placeholder
-shaped like an OAuth token:
+A Claude subscription is an OAuth login instead, and it cannot be started from
+`sbx secret set` -- sbx will tell you so, and point you at the Claude sandbox:
 
 ```bash
-sbx secret set-custom \
-  --host api.anthropic.com \
-  --env ANTHROPIC_OAUTH_TOKEN \
-  --placeholder 'sk-ant-oat01-{rand}'
+sbx run claude          # sign in with /login, then exit
+sbx secret ls           # anthropic should read "(oauth configured)"
 ```
 
-Bind one credential, not both. The two are not interchangeable on the wire:
-OpenClaw picks the request shape from the token it holds, and Anthropic rejects
-the wrong shape or two auth headers at once. The kit's
+That login is stored once per credential store and every later sandbox on that
+host resolves it, with the real token held host-side and refreshed for you.
+
+A token from `claude setup-token` cannot be used here, even though it is a
+genuine OAuth-shaped `sk-ant-oat01-...` string. Bound as a custom secret on
+`api.anthropic.com` it never reaches Anthropic: the sandbox proxy manages auth
+on that host, carrying the sentinel it issued itself and dropping a bearer it
+did not, so the call fails with `x-api-key header is required`.
+
+One binding at a time -- both supported shapes are the same `anthropic` service
+entry. The kit's
 [How auth works](https://github.com/docker/sbx-kits-contrib/blob/main/openclaw/README.md#how-auth-works)
 owns which host credential produces which wire format, and how to switch
 between them.
@@ -210,8 +217,9 @@ with `sbx exec <sandbox-name> -- openclaw --version`.
 | Symptom                                                                                   | Cause                                                                                                                                                             |
 | ----------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `No API key found for provider "anthropic"`                                               | No credential bound on the host. Store one, then start a fresh sandbox.                                                                                           |
-| `authentication_error: API key is invalid`                                                | The credential reached Anthropic in the wrong shape, usually a subscription token bound as a service secret, or a stale service secret still setting `x-api-key`. |
-| `authentication_error: OAuth access token is invalid`                                     | The bearer placeholder went out unswapped, so no matching credential is bound for that host.                                                                      |
+| `authentication_error: API key is invalid`                                                | The API key the proxy sent was rejected: wrong key, revoked, or rotated since this sandbox was created.                                                           |
+| `authentication_error: x-api-key header is required`                                      | A bearer the proxy did not issue is not carried to `api.anthropic.com`. Usually a `claude setup-token` string bound as a custom secret; use an OAuth login.       |
+| `authentication_error: OAuth access token is invalid`                                     | No OAuth login in the credential store this sandbox was created under, or the login behind it expired or was revoked.                                             |
 | `auth flow failed (exit 1)` after `/auth`                                                 | Interactive login needs a TTY the TUI's subprocess does not get. Credentials belong on the host.                                                                  |
 | `origin not allowed` in the browser                                                       | The Control UI was opened on a host port other than the Gateway's. Republish with `--publish 18789:18789/tcp` and open `http://127.0.0.1:18789/`.                 |
 | `control ui requires device identity`                                                     | The Control UI needs a secure context. Open it on `127.0.0.1` rather than a LAN address.                                                                          |

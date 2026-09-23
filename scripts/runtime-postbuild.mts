@@ -7,20 +7,23 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { pathToFileURL } from "node:url";
 import { buildSync } from "esbuild";
-import { verifyBuiltPluginControlPlaneModules } from "./check-built-plugin-control-plane-modules.mts";
-import { copyBundledPluginMetadata } from "./copy-bundled-plugin-metadata.mts";
-import { copyHookMetadata, listHookMetadataOutputs } from "./copy-hook-metadata.ts";
-import { assertRealOutputRoot } from "./lib/output-root-guard.mjs";
-import { escapeRegExp } from "./lib/regexp.mjs";
-import { resolveRepoRoot } from "./lib/repo-root.mjs";
 import {
   readRuntimeDependencyOwnership,
   RUNTIME_DEPENDENCY_OWNERSHIP_RELATIVE_PATH,
   type RuntimeDependencyOwnership,
-} from "./lib/runtime-dependency-ownership-contract.mts";
+} from "../src/infra/runtime-dependency-ownership.ts";
+import { verifyBuiltPluginControlPlaneModules } from "./check-built-plugin-control-plane-modules.mts";
+import { copyBundledPluginMetadata } from "./copy-bundled-plugin-metadata.mts";
+import { copyHookMetadata, listHookMetadataOutputs } from "./copy-hook-metadata.ts";
+import { withDistArtifactOwnership } from "./lib/dist-artifact-ownership.mts";
+import { assertRealOutputRoot } from "./lib/output-root-guard.mjs";
+import { escapeRegExp } from "./lib/regexp.mjs";
+import { resolveRepoRoot } from "./lib/repo-root.mjs";
 import {
   copyStaticExtensionAssets,
   copyStaticExtensionAssetsToRuntimeOverlay,
+  discoverStaticExtensionAssets,
+  shouldCopyStaticExtensionAssets,
 } from "./lib/static-extension-assets.mts";
 import {
   isUpdateCompatibilityChunk,
@@ -29,6 +32,7 @@ import {
   UPDATE_COMPATIBILITY_INVENTORY_FILE,
   writeUpdateCompatibilityChunks,
 } from "./lib/update-compat-chunks.mts";
+import { buildUpdateConfigRuntimeAlias } from "./lib/update-config-runtime-compat.mts";
 import { writeTextFileIfChanged } from "./runtime-postbuild-shared.mjs";
 import { stageBundledPluginRuntime } from "./stage-bundled-plugin-runtime.mts";
 import { writeBuildInfo } from "./write-build-info.ts";
@@ -45,11 +49,6 @@ type RuntimePostBuildParams = {
 };
 type RuntimeFsParams = Pick<RuntimePostBuildParams, "rootDir" | "fs">;
 type LegacyCliExitCompatChunk = { dest: string; contents: string };
-type LegacyRuntimeAlias = {
-  legacyFileName: string;
-  aliasFileName: string;
-  sourceIncludes?: readonly string[];
-};
 
 const LEGACY_UPDATE_NODE_RUNNER_COMPAT_CHUNK = [
   'import path from "node:path";',
@@ -94,126 +93,37 @@ const EXPORT_HTML_VENDOR_ENTRYPOINTS = [
   },
 ];
 const LEGACY_ROOT_RUNTIME_COMPAT_ALIASES: Array<readonly [string, string]> = [
-  // v2026.4.29 dispatch lazy chunks. Package updates used to replace the
-  // dist tree before the live gateway had restarted, so an already-loaded old
-  // dispatch chunk could still resolve these names after the swap.
-  ["abort.runtime-DX6vo4yJ.js", "abort.runtime.js"],
-  ["get-reply-from-config.runtime-uABrvCZ-.js", "get-reply-from-config.runtime.js"],
-  ["reply-media-paths.runtime-C5UnVaLF.js", "reply-media-paths.runtime.js"],
-  ["route-reply.runtime-D4PGzijU.js", "route-reply.runtime.js"],
-  ["runtime-plugins.runtime-fLHuT7Vs.js", "runtime-plugins.runtime.js"],
-  ["tts.runtime-66taD50M.js", "tts.runtime.js"],
-  // v2026.5.2-beta.1 dispatch lazy chunks.
-  ["abort.runtime-CKviLU0L.js", "abort.runtime.js"],
-  ["get-reply-from-config.runtime-BzFAggVK.js", "get-reply-from-config.runtime.js"],
-  ["reply-media-paths.runtime-ZpULeITb.js", "reply-media-paths.runtime.js"],
-  ["route-reply.runtime-uzaOjbd1.js", "route-reply.runtime.js"],
-  ["runtime-plugins.runtime-CNAfmQRG.js", "runtime-plugins.runtime.js"],
-  ["tts.runtime-D-THXDsp.js", "tts.runtime.js"],
-  // v2026.5.2 -> v2026.5.3-beta.3 gateway shutdown chunks. The running
-  // gateway may resolve these only after an npm package tree replacement.
-  ["server-close-DsVPJDIx.js", "server-close.runtime.js"],
-  ["server-close-DvAvfgr8.js", "server-close.runtime.js"],
-  // v2026.5.12-beta.8 gateway shutdown hook chunks.
-  ["hook-runner-global-B8rMIo8I.js", "plugins/hook-runner-global.js"],
-  // v2026.5.3 beta reply-dispatch lazy chunks.
-  ["provider-dispatcher-6EQEtc-t.js", "provider-dispatcher.runtime.js"],
-  ["provider-dispatcher-BpL2E92x.js", "provider-dispatcher.runtime.js"],
-  ["provider-dispatcher-JG96SkLX.js", "provider-dispatcher.runtime.js"],
-  // v2026.5.4 tool/control-plane lazy chunks. These predate the stable
-  // nested dist entries, but live gateways may still import them after update.
-  ["manager-DzRWrKSA.js", "acp/control-plane/manager.js"],
-  ["runtime-CeGN4XUC.js", "web-fetch/runtime.js"],
-  // v2026.5.22 and v2026.6.8 text-transform runtimes. The stable alias remains
+  // v2026.6.8 text-transform runtime. The stable alias remains
   // for old chunks, but new chunks keep hashed imports because the alias export
   // set expanded in v2026.6.8 and may already be cached in a live gateway.
-  ["text-transforms.runtime-D9-SpAmI.js", "text-transforms.runtime.js"],
   ["text-transforms.runtime-sEqsN4pN.js", "text-transforms.runtime.js"],
 ];
 const ROOT_RUNTIME_STABLE_IMPORT_SKIP_ALIASES = new Set(["text-transforms.runtime.js"]);
-const LEGACY_PLUGIN_INSTALL_RUNTIME_MARKERS = [
-  "scanPackageInstallSource",
-  "scanFileInstallSource",
-  "scanInstalledPackageDependencyTree",
-  "scanBundleInstallSource",
-];
 const PLUGIN_INSTALL_RUNTIME_ALIAS = {
   aliasFileName: "install.runtime.js",
-  sourceIncludes: LEGACY_PLUGIN_INSTALL_RUNTIME_MARKERS,
+  sourceIncludes: [
+    "scanPackageInstallSource",
+    "scanFileInstallSource",
+    "scanInstalledPackageDependencyTree",
+    "scanBundleInstallSource",
+  ],
 };
-const LEGACY_PLUGIN_INSTALL_RUNTIME_COMPAT_ALIASES = [
-  // Published releases from v2026.3.22 onward. Older updaters could
-  // overlay package dist instead of swapping it, leaving old install chunks
-  // that still import these hashed plugin install runtime files.
-  "install.runtime-D7SL02B2.js",
-  "install.runtime-Deq6Beal.js",
-  "install.runtime-Eoq8y3HE.js",
-  "install.runtime-DDmlaKdG.js",
-  "install.runtime-ADTafpVD.js",
-  "install.runtime-v8X-j3Tm.js",
-  "install.runtime-BLcZ-44g.js",
-  "install.runtime-vS4aFJvO.js",
-  "install.runtime-Dm_c092A.js",
-  "install.runtime-D_7OUvuY.js",
-  "install.runtime-BLEE0OIk.js",
-  "install.runtime-3LpjZbr8.js",
-  "install.runtime-BrsB9OnV.js",
-  "install.runtime-BEOb-kNW.js",
-  "install.runtime-Cx_xphd1.js",
-  "install.runtime-B-MtEMSR.js",
-  "install.runtime-C-Y4HAqX.js",
-  "install.runtime-j1SedTZh.js",
-  "install.runtime-4zsL_8wt.js",
-  "install.runtime-BhCKlLSJ.js",
-  "install.runtime-tGJ0KhMF.js",
-  "install.runtime-DtmATpak.js",
-  "install.runtime-BzZ38ePb.js",
-  "install.runtime-DwQr7nEE.js",
-  "install.runtime-CEIURnUz.js",
-  "install.runtime-D3EPlM0r.js",
-  "install.runtime-DIlN5H3O.js",
-  "install.runtime-DjcOwVH_.js",
-  "install.runtime-B13jZink.js",
-  "install.runtime-O8MXNrwm.js",
-  "install.runtime-Bkf_VMnk.js",
-  "install.runtime-QOfEzAcZ.js",
-  "install.runtime-BRVACueI.js",
-  "install.runtime-DX8jy7tN.js",
-  "install.runtime-BdfsTamp.js",
-  "install.runtime-B6OA2_P8.js",
-  "install.runtime-D9cTH-C0.js",
-  "install.runtime-OCJULXQo.js",
-  "install.runtime-9ZXBhZSk.js",
-  "install.runtime-DlL3C3t_.js",
-  "install.runtime-TU-jP-TN.js",
-  "install.runtime-a2FlfOSp.js",
-  "install.runtime-BwuRABU1.js",
-  "install.runtime-B3mZL_R2.js",
-  "install.runtime-CWUzypNQ.js",
-  "install.runtime-D6FSd9v2.js",
-  "install.runtime-DQ-ui3nL.js",
-  "install.runtime-CNHwKOIb.js",
-  "install.runtime-Dzuj9tSw.js",
-  "install.runtime-BuF-YAfQ.js",
-  "install.runtime-Xom5hOHq.js",
-  "install.runtime-tnhNR9WW.js",
-].map((legacyFileName) => ({
-  legacyFileName,
-  aliasFileName: PLUGIN_INSTALL_RUNTIME_ALIAS.aliasFileName,
-  sourceIncludes: LEGACY_PLUGIN_INSTALL_RUNTIME_MARKERS,
-}));
 /** Compatibility chunks for old updater and CLI exit modules after package replacement. */
 const LEGACY_CLI_EXIT_COMPAT_CHUNKS = [
   // v2026.8.2 and the exact d413210 and 0229a108 builds load these after replacing dist/.
   // Remove only after the source artifacts fall outside the supported upgrade window.
-  ...["shared-Y6bNiw2w.js", "shared-DTaQo6Hi.js", "shared-1Uyqkfns.js"].map((fileName) => ({
-    dest: `dist/${fileName}`,
+  {
+    dest: "dist/shared-Y6bNiw2w.js",
     contents: LEGACY_UPDATE_NODE_RUNNER_COMPAT_CHUNK,
-  })),
-  ...["memory-state-CcqRgDZU.js", "memory-state-DwGdReW4.js"].map((fileName) => ({
-    dest: `dist/${fileName}`,
-    contents: "export function hasMemoryRuntime() {\n  return false;\n}\n",
-  })),
+  },
+  {
+    dest: "dist/shared-DTaQo6Hi.js",
+    contents: LEGACY_UPDATE_NODE_RUNNER_COMPAT_CHUNK,
+  },
+  {
+    dest: "dist/shared-1Uyqkfns.js",
+    contents: LEGACY_UPDATE_NODE_RUNNER_COMPAT_CHUNK,
+  },
 ];
 
 /**
@@ -334,24 +244,10 @@ function listLegacyRootRuntimeCompatOutputs(params: RuntimeFsParams = {}) {
   const rootDir = params.rootDir ?? ROOT;
   const distDir = path.join(rootDir, "dist");
   const fsImpl = params.fs ?? fs;
-  const aliases: LegacyRuntimeAlias[] = [
-    ...LEGACY_ROOT_RUNTIME_COMPAT_ALIASES.map(([legacyFileName, aliasFileName]) => ({
-      legacyFileName,
-      aliasFileName,
-    })),
-    ...LEGACY_PLUGIN_INSTALL_RUNTIME_COMPAT_ALIASES,
-  ];
-  return aliases
-    .filter((entry) =>
-      resolveLegacyRootRuntimeCompatTarget(
-        entry.legacyFileName,
-        entry.aliasFileName,
-        distDir,
-        fsImpl,
-        entry.sourceIncludes,
-      ),
-    )
-    .map(({ legacyFileName }) => `dist/${legacyFileName}`)
+  return LEGACY_ROOT_RUNTIME_COMPAT_ALIASES.filter(([, aliasFileName]) =>
+    fsImpl.existsSync(path.join(distDir, aliasFileName)),
+  )
+    .map(([legacyFileName]) => `dist/${legacyFileName}`)
     .toSorted((left, right) => left.localeCompare(right));
 }
 
@@ -527,7 +423,13 @@ export function writeStableRootRuntimeAliases(params: RuntimeFsParams = {}) {
       }
       continue;
     }
-    const source = buildRuntimeAliasSource(candidate, distDir, fsImpl);
+    const source =
+      aliasFileName === "io.runtime.js"
+        ? buildUpdateConfigRuntimeAlias(
+            candidate,
+            fsImpl.readFileSync(path.join(distDir, candidate), "utf8"),
+          )
+        : buildRuntimeAliasSource(candidate, distDir, fsImpl);
     const owner = ownership?.chunks[candidate];
     if (ownership && owner) {
       const targetSource = fsImpl.readFileSync(path.join(distDir, candidate));
@@ -620,11 +522,8 @@ function resolveRootRuntimeCandidateByMarkers(
   aliasFileName: string,
   distDir: string,
   fsImpl: typeof fs,
-  sourceIncludes?: readonly string[],
+  sourceIncludes: readonly string[],
 ) {
-  if (!sourceIncludes?.length) {
-    return null;
-  }
   const match = aliasFileName.match(ROOT_STABLE_RUNTIME_ALIAS_PATTERN);
   if (!match) {
     return null;
@@ -659,28 +558,6 @@ function resolveRootRuntimeCandidateByMarkers(
   return candidates.length === 1 ? (candidates[0] ?? null) : null;
 }
 
-function resolveLegacyRootRuntimeCompatTarget(
-  legacyFileName: string,
-  aliasFileName: string,
-  distDir: string,
-  fsImpl: typeof fs,
-  sourceIncludes?: readonly string[],
-) {
-  if (aliasFileName && fsImpl.existsSync(path.join(distDir, aliasFileName))) {
-    return aliasFileName;
-  }
-  const match = legacyFileName.match(ROOT_RUNTIME_ALIAS_PATTERN);
-  if (!match?.groups?.base) {
-    return null;
-  }
-  return resolveRootRuntimeCandidateByMarkers(
-    `${match.groups.base}.js`,
-    distDir,
-    fsImpl,
-    sourceIncludes,
-  );
-}
-
 /**
  * Writes compatibility aliases for shipped hashed runtime chunk names.
  * @internal Directly tested script implementation detail.
@@ -689,30 +566,15 @@ export function writeLegacyRootRuntimeCompatAliases(params: RuntimeFsParams = {}
   const rootDir = params.rootDir ?? ROOT;
   const distDir = path.join(rootDir, "dist");
   const fsImpl = params.fs ?? fs;
-  const aliases: LegacyRuntimeAlias[] = [
-    ...LEGACY_ROOT_RUNTIME_COMPAT_ALIASES.map(([legacyFileName, aliasFileName]) => ({
-      legacyFileName,
-      aliasFileName,
-    })),
-    ...LEGACY_PLUGIN_INSTALL_RUNTIME_COMPAT_ALIASES,
-  ];
-  for (const entry of aliases) {
-    const { legacyFileName } = entry;
+  for (const [legacyFileName, aliasFileName] of LEGACY_ROOT_RUNTIME_COMPAT_ALIASES) {
     const legacyPath = path.join(distDir, legacyFileName);
     if (fsImpl.existsSync(legacyPath)) {
       continue;
     }
-    const targetFileName = resolveLegacyRootRuntimeCompatTarget(
-      legacyFileName,
-      entry.aliasFileName,
-      distDir,
-      fsImpl,
-      entry.sourceIncludes,
-    );
-    if (!targetFileName) {
+    if (!fsImpl.existsSync(path.join(distDir, aliasFileName))) {
       continue;
     }
-    writeTextFileIfChanged(legacyPath, buildRuntimeAliasSource(targetFileName, distDir, fsImpl));
+    writeTextFileIfChanged(legacyPath, buildRuntimeAliasSource(aliasFileName, distDir, fsImpl));
   }
 }
 
@@ -728,11 +590,6 @@ export function writeLegacyCliExitCompatChunks(
   for (const { dest, contents } of chunks) {
     writeTextFileIfChanged(path.join(rootDir, dest), contents);
   }
-}
-
-function shouldCopyStaticExtensionAssets(params: RuntimePostBuildParams) {
-  const env = params.env ?? process.env;
-  return env.OPENCLAW_RUNTIME_POSTBUILD_STATIC_ASSETS !== "0";
 }
 
 /**
@@ -785,8 +642,12 @@ export function runRuntimePostBuild(params: RuntimePostBuildParams = {}) {
     if (!shouldCopyStaticExtensionAssets(phaseParams)) {
       return;
     }
-    copyStaticExtensionAssets(phaseParams);
-    copyStaticExtensionAssetsToRuntimeOverlay(phaseParams);
+    const assetParams = {
+      ...phaseParams,
+      assets: discoverStaticExtensionAssets(phaseParams),
+    };
+    copyStaticExtensionAssets(assetParams);
+    copyStaticExtensionAssetsToRuntimeOverlay(assetParams);
   });
   runPhase("stable root runtime imports", () =>
     rewriteRootRuntimeImportsToStableAliases(phaseParams),
@@ -813,5 +674,7 @@ export function runRuntimePostBuild(params: RuntimePostBuildParams = {}) {
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
-  runRuntimePostBuild();
+  await withDistArtifactOwnership(process.cwd(), async () => {
+    runRuntimePostBuild();
+  });
 }

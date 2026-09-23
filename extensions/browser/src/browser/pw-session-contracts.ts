@@ -91,6 +91,7 @@ export type ArmedDialogResponse = {
 export type ConnectedBrowser = {
   browser: Browser;
   cdpUrl: string;
+  engine?: "chromium" | "lightpanda";
   onDisconnected?: () => void;
 };
 
@@ -163,7 +164,6 @@ export type ContextState = {
 export const pageStates = new WeakMap<Page, PageState>();
 export const contextStates = new WeakMap<BrowserContext, ContextState>();
 export const observedContexts = new WeakSet<BrowserContext>();
-export const observedPages = new WeakSet<Page>();
 
 export const MAX_CONSOLE_MESSAGES = 500;
 export const MAX_PAGE_ERRORS = 200;
@@ -187,7 +187,6 @@ export const cachedByCdpUrl = new Map<string, ConnectedBrowser>();
 export const connectingByCdpUrl = new Map<string, PendingBrowserConnection>();
 export const retainedClosingByCdpUrl = new Map<string, Set<ConnectedBrowser>>();
 export const closeConnectionPromises = new WeakMap<ConnectedBrowser, Promise<void>>();
-export const closedConnections = new WeakSet<ConnectedBrowser>();
 export const PLAYWRIGHT_CONNECTION_CLOSE_TIMEOUT_MS = 2_000;
 export const blockedTargetsByCdpUrl = new Set<string>();
 export const blockedPageRefsByCdpUrl = new Map<string, WeakSet<Page>>();

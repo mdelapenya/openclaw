@@ -9,20 +9,25 @@ import type { SkillsRouteData } from "./skills-page.ts";
 async function loadSkillsRouteData(
   context: ApplicationContext,
   options: RouteLoaderOptions,
+  surface: "discovery" | "settings",
 ): Promise<SkillsRouteData> {
   const search = new URLSearchParams(options.location.search);
   const clawhubRef = search.get("clawhub") ?? undefined;
   const gateway = context.gateway;
   const gatewaySnapshot = gateway.snapshot;
   const agents = context.agents;
+  const selectionOwner =
+    surface === "settings" ? context.settingsAgentSelection : context.agentSelection;
+  const selection = selectionOwner.state;
+  const selectionIntentRevision = selectionOwner.intentRevision;
   const client = gatewaySnapshot.client;
   if (gatewaySnapshot.phase !== "connected" || !client) {
     return {
       gateway,
       gatewaySnapshot,
       agents,
-      agentsList: null,
       selectedAgentId: null,
+      selectionIntentRevision,
       report: null,
       error: null,
       clawhubRef,
@@ -30,13 +35,12 @@ async function loadSkillsRouteData(
   }
 
   let error: string | null = null;
-  let agentsList: SkillsRouteData["agentsList"] = null;
   let selectedAgentId: string | null = null;
   let report: SkillsRouteData["report"] = null;
   try {
     const loadedAgentsList = await agents.ensureList();
-    agentsList = loadedAgentsList;
-    const requestedAgentId = search.get("agent") ?? loadedAgentsList?.defaultId;
+    const requestedAgentId =
+      search.get("agent") ?? selection.selectedId ?? loadedAgentsList?.defaultId;
     selectedAgentId = loadedAgentsList?.agents.some((agent) => agent.id === requestedAgentId)
       ? (requestedAgentId ?? null)
       : null;
@@ -54,22 +58,35 @@ async function loadSkillsRouteData(
     gateway,
     gatewaySnapshot,
     agents,
-    agentsList,
     selectedAgentId,
+    selectionIntentRevision,
     report,
     error,
     clawhubRef,
   };
 }
 
-export const page = definePage({
-  ...routePageSpec("skills"),
-  loaderDeps: (_context: ApplicationContext, location) => location.search,
-  loader: loadSkillsRouteData,
-  component: () =>
-    import("./skills-page.ts").then(() => ({
-      header: true,
-      render: (data: SkillsRouteData | undefined) =>
-        data ? html`<openclaw-skills-page .routeData=${data}></openclaw-skills-page>` : nothing,
-    })),
-});
+function defineSkillsPage(routeId: "skills" | "skill-settings", surface: "discovery" | "settings") {
+  return definePage({
+    ...routePageSpec(routeId),
+    loaderDeps: (_context: ApplicationContext, location) => location.search,
+    loader: (context: ApplicationContext, options) =>
+      loadSkillsRouteData(context, options, surface),
+    component: () =>
+      import("./skills-page.ts").then(() => ({
+        header: true,
+        render: (data: SkillsRouteData | undefined) =>
+          data
+            ? html`<openclaw-skills-page
+                .routeData=${data}
+                .surface=${surface}
+              ></openclaw-skills-page>`
+            : nothing,
+      })),
+  });
+}
+
+export const pages = [
+  defineSkillsPage("skills", "discovery"),
+  defineSkillsPage("skill-settings", "settings"),
+] as const;

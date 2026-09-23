@@ -114,6 +114,8 @@ export type ResolvedBrowserTabCleanupConfig = {
 /** Runtime browser profile settings resolved from global and profile config. */
 export type ResolvedBrowserProfile = {
   name: string;
+  /** Omitted only by legacy callers; defaults to Chromium. */
+  engine?: "chromium" | "lightpanda";
   cdpPort: number;
   cdpUrl: string;
   cdpHost: string;
@@ -137,7 +139,6 @@ export function getOwnBrowserProfile<T>(
   return profiles && Object.hasOwn(profiles, name) ? profiles[name] : undefined;
 }
 
-const DEFAULT_BROWSER_CDP_PORT_RANGE_START = 18800;
 const DEFAULT_BROWSER_REMOTE_CDP_TIMEOUT_MS = 1_500;
 const DEFAULT_BROWSER_REMOTE_CDP_HANDSHAKE_TIMEOUT_MS = 3_000;
 /**
@@ -223,8 +224,13 @@ function hasLinuxDisplay(env: NodeJS.ProcessEnv): boolean {
   return Boolean(env.DISPLAY?.trim() || env.WAYLAND_DISPLAY?.trim());
 }
 
-function isLocalManagedProfile(profile: ResolvedBrowserProfile): boolean {
-  return profile.driver === "openclaw" && profile.cdpIsLoopback && !profile.attachOnly;
+export function isLocalManagedProfile(profile: ResolvedBrowserProfile): boolean {
+  return (
+    profile.engine !== "lightpanda" &&
+    profile.driver === "openclaw" &&
+    profile.cdpIsLoopback &&
+    !profile.attachOnly
+  );
 }
 
 function resolveBrowserTabCleanupConfig(
@@ -259,50 +265,6 @@ function resolveBrowserSsrFPolicy(cfg: BrowserConfig | undefined): SsrFPolicy | 
   // Keep an explicit strict object so every browser guard stays fail-closed
   // even when the operator leaves the shared policy unconfigured.
   return resolved ?? (hasExplicitPrivateSetting ? { dangerouslyAllowPrivateNetwork: false } : {});
-}
-
-function ensureDefaultProfile(
-  profiles: Record<string, BrowserProfileConfig> | undefined,
-  legacyCdpPort?: number,
-  derivedDefaultCdpPort?: number,
-  legacyCdpUrl?: string,
-): Record<string, BrowserProfileConfig> {
-  const result = { ...profiles };
-  if (!result[DEFAULT_OPENCLAW_BROWSER_PROFILE_NAME]) {
-    result[DEFAULT_OPENCLAW_BROWSER_PROFILE_NAME] = {
-      cdpPort: legacyCdpPort ?? derivedDefaultCdpPort ?? DEFAULT_BROWSER_CDP_PORT_RANGE_START,
-      ...(legacyCdpUrl ? { cdpUrl: legacyCdpUrl } : {}),
-    };
-  }
-  return result;
-}
-
-function ensureDefaultUserBrowserProfile(
-  profiles: Record<string, BrowserProfileConfig>,
-): Record<string, BrowserProfileConfig> {
-  const result = { ...profiles };
-  if (result.user) {
-    return result;
-  }
-  result.user = {
-    driver: "existing-session",
-    attachOnly: true,
-  };
-  return result;
-}
-
-/** Built-in profile for the Chrome extension relay (user's signed-in browser). */
-function ensureDefaultChromeExtensionProfile(
-  profiles: Record<string, BrowserProfileConfig>,
-): Record<string, BrowserProfileConfig> {
-  const result = { ...profiles };
-  if (result.chrome) {
-    return result;
-  }
-  result.chrome = {
-    driver: "extension",
-  };
-  return result;
 }
 
 /**
@@ -348,29 +310,22 @@ function resolveExtensionRelayPorts(
   return ports;
 }
 
-function applyLegacyCdpUrlToExistingSessionDefaultProfile(
-  profiles: Record<string, BrowserProfileConfig>,
-  defaultProfile: string,
-  legacyCdpUrl: string | undefined,
-): Record<string, BrowserProfileConfig> {
-  if (!legacyCdpUrl) {
-    return profiles;
+function assertDedicatedLightpandaEndpoints(profiles: Record<string, BrowserProfileConfig>): void {
+  const endpoints = new Map<string, { name: string; engine?: string }>();
+  for (const [name, profile] of Object.entries(profiles)) {
+    const endpoint = profile.cdpUrl ? URL.parse(profile.cdpUrl) : null;
+    if (!endpoint) {
+      continue;
+    }
+    const key = endpoint.toString().replace(/\/$/, "");
+    const previous = endpoints.get(key);
+    if (previous && (previous.engine === "lightpanda" || profile.engine === "lightpanda")) {
+      throw new Error(
+        `Lightpanda requires a dedicated CDP endpoint; profiles "${previous.name}" and "${name}" share one.`,
+      );
+    }
+    endpoints.set(key, { name, engine: profile.engine });
   }
-  const profile = getOwnBrowserProfile(profiles, defaultProfile);
-  if (
-    !profile ||
-    profile.driver !== "existing-session" ||
-    normalizeOptionalString(profile.cdpUrl)
-  ) {
-    return profiles;
-  }
-  return {
-    ...profiles,
-    [defaultProfile]: {
-      ...profile,
-      cdpUrl: legacyCdpUrl,
-    },
-  };
 }
 
 /** Resolve raw browser config into runtime browser defaults. */
@@ -422,36 +377,34 @@ export function resolveBrowserConfig(
   const noSandbox = cfg?.noSandbox === true;
   const attachOnly = cfg?.attachOnly === true;
   const executablePath = normalizeExecutablePath(cfg?.executablePath);
-  const defaultProfileFromConfig = normalizeOptionalString(cfg?.defaultProfile);
-
-  const legacyCdpPort = rawCdpUrl ? cdpInfo.port : undefined;
-  const isWsUrl = cdpInfo.parsed.protocol === "ws:" || cdpInfo.parsed.protocol === "wss:";
-  const legacyCdpUrl = rawCdpUrl && isWsUrl ? cdpInfo.normalized : undefined;
-  let profiles = ensureDefaultChromeExtensionProfile(
-    ensureDefaultUserBrowserProfile(
-      ensureDefaultProfile(cfg?.profiles, legacyCdpPort, cdpPortRangeStart, legacyCdpUrl),
-    ),
-  );
-  const cdpProtocol = cdpInfo.parsed.protocol === "https:" ? "https" : "http";
-
   const defaultProfile =
-    defaultProfileFromConfig ??
-    (profiles[DEFAULT_BROWSER_DEFAULT_PROFILE_NAME]
-      ? DEFAULT_BROWSER_DEFAULT_PROFILE_NAME
-      : profiles[DEFAULT_OPENCLAW_BROWSER_PROFILE_NAME]
-        ? DEFAULT_OPENCLAW_BROWSER_PROFILE_NAME
-        : "user");
-  profiles = applyLegacyCdpUrlToExistingSessionDefaultProfile(
-    profiles,
-    defaultProfile,
-    rawCdpUrl ? cdpInfo.normalized : undefined,
-  );
+    normalizeOptionalString(cfg?.defaultProfile) ?? DEFAULT_BROWSER_DEFAULT_PROFILE_NAME;
+
+  const isWsUrl = cdpInfo.parsed.protocol === "ws:" || cdpInfo.parsed.protocol === "wss:";
+  const profiles = { ...cfg?.profiles };
+  profiles[DEFAULT_OPENCLAW_BROWSER_PROFILE_NAME] ||= {
+    cdpPort: rawCdpUrl ? cdpInfo.port : cdpPortRangeStart,
+    ...(rawCdpUrl && isWsUrl ? { cdpUrl: cdpInfo.normalized } : {}),
+  };
+  profiles.user ||= { driver: "existing-session", attachOnly: true };
+  profiles.chrome ||= { driver: "extension" };
+  const cdpProtocol = cdpInfo.parsed.protocol === "https:" ? "https" : "http";
+  const selectedProfile = getOwnBrowserProfile(profiles, defaultProfile);
+  if (
+    rawCdpUrl &&
+    selectedProfile?.driver === "existing-session" &&
+    !normalizeOptionalString(selectedProfile.cdpUrl)
+  ) {
+    profiles[defaultProfile] = { ...selectedProfile, cdpUrl: cdpInfo.normalized };
+  }
 
   const extraArgs = Array.isArray(cfg?.extraArgs)
     ? cfg.extraArgs.filter(
         (value): value is string => typeof value === "string" && value.trim().length > 0,
       )
     : [];
+
+  assertDedicatedLightpandaEndpoints(profiles);
 
   return {
     enabled,
@@ -490,6 +443,15 @@ export function resolveBrowserConfig(
   };
 }
 
+/** Selector-free extension pairing follows configuration order, independently of defaultProfile. */
+export function resolveFirstExtensionProfileName(
+  resolved: Pick<ResolvedBrowserConfig, "profiles">,
+): string | undefined {
+  return Object.entries(resolved.profiles).find(
+    ([, profile]) => profile.driver === "extension",
+  )?.[0];
+}
+
 /** Resolve one configured browser profile by name. */
 export function resolveProfile(
   resolved: ResolvedBrowserConfig,
@@ -498,6 +460,54 @@ export function resolveProfile(
   const profile = getOwnBrowserProfile(resolved.profiles, profileName);
   if (!profile) {
     return null;
+  }
+
+  const engine = profile.engine ?? "chromium";
+  if (engine !== "chromium" && engine !== "lightpanda") {
+    throw new Error(`browser.profiles.${profileName}.engine must be chromium or lightpanda.`);
+  }
+  if (engine === "lightpanda") {
+    // Also validate here: callers can resolve programmatic config without
+    // passing through the persisted-config schema first.
+    const endpoint = profile.cdpUrl ? URL.parse(profile.cdpUrl) : null;
+    if (!endpoint || !["ws:", "wss:"].includes(endpoint.protocol)) {
+      throw new Error(
+        `browser.profiles.${profileName}.cdpUrl must be an explicit ws:// or wss:// Lightpanda endpoint.`,
+      );
+    }
+    if (profile.attachOnly !== true) {
+      throw new Error(`browser.profiles.${profileName} requires attachOnly: true for Lightpanda.`);
+    }
+    if (profile.driver !== undefined && profile.driver !== "openclaw") {
+      throw new Error(
+        `browser.profiles.${profileName} requires the default CDP driver for Lightpanda.`,
+      );
+    }
+    for (const key of [
+      "cdpPort",
+      "userDataDir",
+      "mcpCommand",
+      "mcpArgs",
+      "headless",
+      "executablePath",
+    ] as const) {
+      if (profile[key] !== undefined) {
+        throw new Error(`browser.profiles.${profileName}.${key} is not supported by Lightpanda.`);
+      }
+    }
+    return {
+      name: profileName,
+      engine,
+      cdpUrl: endpoint.toString(),
+      cdpHost: endpoint.hostname,
+      cdpPort: Number(endpoint.port || (endpoint.protocol === "wss:" ? 443 : 80)),
+      cdpIsLoopback: isLoopbackHost(endpoint.hostname),
+      color: DEFAULT_OPENCLAW_BROWSER_COLOR,
+      driver: "openclaw",
+      headless: true,
+      headlessSource: "default",
+      attachOnly: true,
+    };
   }
 
   const rawProfileUrl = profile.cdpUrl?.trim() ?? "";
@@ -530,6 +540,7 @@ export function resolveProfile(
       : `http://127.0.0.1:${relayPort}`;
     return {
       name: profileName,
+      engine,
       cdpPort: relayPort,
       cdpUrl: relayCdpUrl,
       cdpHost: "127.0.0.1",
@@ -551,6 +562,7 @@ export function resolveProfile(
     );
     return {
       name: profileName,
+      engine,
       cdpPort: 0,
       cdpUrl: existingSessionCdp?.cdpUrl ?? "",
       cdpHost: existingSessionCdp?.cdpHost ?? "",
@@ -602,6 +614,7 @@ export function resolveProfile(
 
   return {
     name: profileName,
+    engine,
     cdpPort,
     cdpUrl,
     cdpHost,

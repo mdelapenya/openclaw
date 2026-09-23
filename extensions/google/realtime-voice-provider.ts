@@ -1,4 +1,3 @@
-// Google provider module implements model/runtime integration.
 import { randomUUID } from "node:crypto";
 import {
   ActivityHandling,
@@ -57,9 +56,12 @@ import {
 } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { canonicalizeGoogleProviderBase64 } from "./base64.js";
 import { createGoogleGenAI } from "./google-genai-runtime.js";
+import {
+  GOOGLE_REALTIME_DEFAULT_MODEL,
+  GOOGLE_REALTIME_VOICE_METADATA,
+} from "./realtime-voice-metadata.js";
 import { resolveGoogleGemini3ThinkingLevel } from "./thinking-api.js";
 
-const GOOGLE_REALTIME_DEFAULT_MODEL = "gemini-3.1-flash-live-preview";
 const GOOGLE_REALTIME_DEFAULT_VOICE = "Kore";
 const GOOGLE_REALTIME_DEFAULT_API_VERSION = "v1beta";
 const GOOGLE_REALTIME_INPUT_SAMPLE_RATE = 16_000;
@@ -129,26 +131,10 @@ type GoogleRealtimeVoiceProviderConfig = {
   thinkingBudget?: number;
 };
 
-type GoogleRealtimeLiveConfig = {
+type GoogleRealtimeLiveConfig = GoogleRealtimeVoiceProviderConfig & {
   apiKey: string;
   instructions?: string;
   tools?: RealtimeVoiceTool[];
-  model?: string;
-  voice?: string;
-  temperature?: number;
-  apiVersion?: string;
-  prefixPaddingMs?: number;
-  silenceDurationMs?: number;
-  startSensitivity?: GoogleRealtimeSensitivity;
-  endSensitivity?: GoogleRealtimeSensitivity;
-  activityHandling?: GoogleRealtimeActivityHandling;
-  turnCoverage?: GoogleRealtimeTurnCoverage;
-  automaticActivityDetectionDisabled?: boolean;
-  enableAffectiveDialog?: boolean;
-  sessionResumption?: boolean;
-  contextWindowCompression?: boolean;
-  thinkingLevel?: GoogleRealtimeThinkingLevel;
-  thinkingBudget?: number;
 };
 
 type GoogleRealtimeVoiceBridgeConfig = RealtimeVoiceBridgeCreateRequest & GoogleRealtimeLiveConfig;
@@ -157,10 +143,6 @@ type GoogleLiveTranscriptAccumulator = {
   text: string;
   byteCount: number;
 };
-
-function trimToUndefined(value: unknown): string | undefined {
-  return normalizeOptionalString(value);
-}
 
 function asSensitivity(value: unknown): GoogleRealtimeSensitivity | undefined {
   const normalized = normalizeOptionalString(value)?.toLowerCase();
@@ -215,15 +197,6 @@ function asNonNegativeInteger(value: unknown): number | undefined {
   return asSafeIntegerInRange(value, { min: 0 });
 }
 
-function asGoogleRealtimeThinkingBudget(value: unknown): number | undefined {
-  const budget = asFiniteNumber(value);
-  return budget !== undefined &&
-    Number.isSafeInteger(budget) &&
-    (budget === -1 || (budget >= 0 && budget <= 24_576))
-    ? budget
-    : undefined;
-}
-
 function resolveGoogleRealtimeProviderConfigRecord(
   config: Record<string, unknown>,
 ): Record<string, unknown> | undefined {
@@ -241,10 +214,10 @@ function normalizeProviderConfig(
       value: raw?.apiKey ?? cfg?.models?.providers?.google?.apiKey,
       path: "plugins.entries.voice-call.config.realtime.providers.google.apiKey",
     }),
-    model: trimToUndefined(raw?.model),
-    voice: trimToUndefined(raw?.speakerVoice) ?? trimToUndefined(raw?.voice),
+    model: normalizeOptionalString(raw?.model),
+    voice: normalizeOptionalString(raw?.speakerVoice) ?? normalizeOptionalString(raw?.voice),
     temperature: asFiniteNumber(raw?.temperature),
-    apiVersion: trimToUndefined(raw?.apiVersion),
+    apiVersion: normalizeOptionalString(raw?.apiVersion),
     prefixPaddingMs: asNonNegativeInteger(raw?.prefixPaddingMs),
     silenceDurationMs: asNonNegativeInteger(raw?.silenceDurationMs),
     startSensitivity: asSensitivity(raw?.startSensitivity),
@@ -256,12 +229,15 @@ function normalizeProviderConfig(
     sessionResumption: asBoolean(raw?.sessionResumption),
     contextWindowCompression: asBoolean(raw?.contextWindowCompression),
     thinkingLevel: asThinkingLevel(raw?.thinkingLevel),
-    thinkingBudget: asGoogleRealtimeThinkingBudget(raw?.thinkingBudget),
+    thinkingBudget: asSafeIntegerInRange(raw?.thinkingBudget, { min: -1, max: 24_576 }),
   };
 }
 
 function resolveEnvApiKey(): string | undefined {
-  return trimToUndefined(process.env.GEMINI_API_KEY) ?? trimToUndefined(process.env.GOOGLE_API_KEY);
+  return (
+    normalizeOptionalString(process.env.GEMINI_API_KEY) ??
+    normalizeOptionalString(process.env.GOOGLE_API_KEY)
+  );
 }
 
 // Gemini 3.1 Live replaces client-content text and async tools with realtime text
@@ -823,7 +799,7 @@ class GoogleRealtimeVoiceBridge implements RealtimeVoiceBridge {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
     }
-    this.clearPendingAudio();
+    this.pendingAudio.clear();
     this.consecutiveSilenceMs = 0;
     this.audioStreamEnded = false;
     this.resetToolCallOwnership();
@@ -898,18 +874,14 @@ class GoogleRealtimeVoiceBridge implements RealtimeVoiceBridge {
   }
 
   private captureSessionLifecycle(message: LiveServerMessage): void {
-    const raw = message as unknown as {
-      goAway?: { timeLeft?: string };
-      sessionResumptionUpdate?: { newHandle?: string; resumable?: boolean };
-    };
-    const update = raw.sessionResumptionUpdate;
+    const update = message.sessionResumptionUpdate;
     if (update?.resumable === false) {
       this.resumptionHandle = undefined;
     } else if (update?.resumable && update.newHandle) {
       this.resumptionHandle = update.newHandle;
     }
-    if (raw.goAway?.timeLeft) {
-      this.config.onError?.(new Error(`Google Live session goAway: ${raw.goAway.timeLeft}`));
+    if (message.goAway?.timeLeft) {
+      this.config.onError?.(new Error(`Google Live session goAway: ${message.goAway.timeLeft}`));
     }
   }
 
@@ -1105,14 +1077,10 @@ class GoogleRealtimeVoiceBridge implements RealtimeVoiceBridge {
     if (this.closeNotified) {
       return;
     }
-    this.clearPendingAudio();
+    this.pendingAudio.clear();
     this.responseInterrupted = false;
     this.closeNotified = true;
     this.config.onClose?.(reason);
-  }
-
-  private clearPendingAudio(): void {
-    this.pendingAudio.clear();
   }
 
   private cancelConnectAttempt(attempt: GoogleLiveConnectionAttempt | undefined): void {
@@ -1390,10 +1358,7 @@ async function createGoogleRealtimeBrowserSession(
 
 export function buildGoogleRealtimeVoiceProvider(): RealtimeVoiceProviderPlugin {
   return {
-    id: "google",
-    label: "Google Live Voice",
-    defaultModel: GOOGLE_REALTIME_DEFAULT_MODEL,
-    autoSelectOrder: 20,
+    ...GOOGLE_REALTIME_VOICE_METADATA,
     capabilities: {
       transports: ["provider-websocket", "gateway-relay"],
       inputAudioFormats: [
@@ -1422,23 +1387,8 @@ export function buildGoogleRealtimeVoiceProvider(): RealtimeVoiceProviderPlugin 
       }
       return new GoogleRealtimeVoiceBridge({
         ...req,
+        ...config,
         apiKey,
-        model: config.model,
-        voice: config.voice,
-        temperature: config.temperature,
-        apiVersion: config.apiVersion,
-        prefixPaddingMs: config.prefixPaddingMs,
-        silenceDurationMs: config.silenceDurationMs,
-        startSensitivity: config.startSensitivity,
-        endSensitivity: config.endSensitivity,
-        activityHandling: config.activityHandling,
-        turnCoverage: config.turnCoverage,
-        automaticActivityDetectionDisabled: config.automaticActivityDetectionDisabled,
-        enableAffectiveDialog: config.enableAffectiveDialog,
-        sessionResumption: config.sessionResumption,
-        contextWindowCompression: config.contextWindowCompression,
-        thinkingLevel: config.thinkingLevel,
-        thinkingBudget: config.thinkingBudget,
       });
     },
     createBrowserSession: createGoogleRealtimeBrowserSession,
